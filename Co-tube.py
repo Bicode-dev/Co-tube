@@ -676,45 +676,289 @@ def _apply_cookies(ydl_opts: dict, cfg: dict, verbose: bool = False) -> str | No
 # ─────────────────────────────────────────────────────────────────────────────
 # Téléchargement
 # ─────────────────────────────────────────────────────────────────────────────
-def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rendu de progression du téléchargement
+# ─────────────────────────────────────────────────────────────────────────────
+class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
+    """Affiche la progression sur 4 lignes fixes (ANSI \033[A\r).
+
+    Ligne 1 : TOTAL  — pourcentage global + ETA globale
+    Ligne 2 : Séparateur
+    Ligne 3 : Étape courante (subs / vidéo / merge) + ETA
+    Ligne 4 : Barre de progression de l'étape courante
+
+    Le rendu est basé sur des appels \r + \033[A pour remonter de ligne
+    sans faire défiler le terminal.
+    """
+
+    _CYAN   = "\033[36m"
+    _GREEN  = "\033[32m"
+    _YELLOW = "\033[33m"
+    _BOLD   = "\033[1m"
+    _DIM    = "\033[2m"
+    _RESET  = "\033[0m"
+    _UP     = "\033[A"   # remonter d'une ligne
+
+    _BAR_W  = 30         # largeur de la barre de progression
+
+    def __init__(self, n_subs: int, titre: str) -> None:
+        self._n_subs         = n_subs       # nb total de langues de sous-titres
+        self._titre          = titre[:50]
+        self._total_pct      = 0.0          # % total (0-100)
+        self._total_eta      = ""
+        self._step_label     = ""           # "Sous-titres", "Vidéo", "Merge"
+        self._step_pct       = 0.0
+        self._step_eta       = ""
+        self._step_spd       = ""           # vitesse courante (vidéo uniquement)
+        self._sub_done       = 0            # nombre de subs téléchargés
+        self._printed        = False        # True après le premier rendu
+        self._phase          = "init"       # "subs" | "video" | "merge"
+        self._video_bytes    = 0            # octets vidéo téléchargés
+        self._video_total    = 0            # octets vidéo totaux
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _bar(pct: float, width: int = 30) -> str:
+        """Génère une barre de progression ASCII."""
+        filled = int(width * min(pct, 100) / 100)
+        return "█" * filled + "░" * (width - filled)
+
+    @staticmethod
+    def _fmt_eta(seconds) -> str:
+        """Formate un nombre de secondes en mm:ss ou hh:mm:ss."""
+        try:
+            secs = int(float(seconds))
+        except (TypeError, ValueError):
+            return "--:--"
+        if secs <= 0:
+            return "--:--"
+        h, rem = divmod(secs, 3600)
+        m, s   = divmod(rem, 60)
+        if h:
+            return f"{h}h{m:02d}m{s:02d}s"
+        return f"{m:02d}m{s:02d}s"
+
+    @staticmethod
+    def _fmt_speed(speed) -> str:
+        """Formate une vitesse en Ko/s ou Mo/s."""
+        try:
+            bps = float(speed)
+        except (TypeError, ValueError):
+            return ""
+        if bps >= 1_000_000:
+            return f"{bps/1_000_000:.1f} Mo/s"
+        return f"{bps/1_000:.0f} Ko/s"
+
+    # ── Mise à jour depuis le hook yt-dlp ────────────────────────────────────
+
+    def on_progress(self, d: dict) -> None:  # pylint: disable=too-many-branches
+        """Appelé à chaque tick de yt-dlp (progress_hook)."""
+        status   = d.get("status", "")
+        filename = d.get("filename", "")
+
+        is_sub = (
+            filename.endswith((".vtt", ".srt", ".ttml", ".srv1", ".srv2", ".srv3"))
+            or d.get("info_dict", {}).get("_type") == "subtitle"
+        )
+
+        if status == "downloading":
+            downloaded = d.get("downloaded_bytes") or 0
+            total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            pct        = (downloaded / total * 100) if total > 0 else 0
+            eta_raw    = d.get("eta")
+            speed      = d.get("speed")
+            eta_str    = self._fmt_eta(eta_raw)
+            spd_str    = self._fmt_speed(speed)
+
+            if is_sub:
+                self._phase      = "subs"
+                self._step_label = (
+                    f"Sous-titres  ({self._sub_done + 1}/{self._n_subs})"
+                    if self._n_subs else "Sous-titres"
+                )
+                self._step_pct   = pct
+                self._step_eta   = ""
+                self._step_spd   = ""
+                # Total : proportion subs dans l'ensemble (subs = ~5 % du total)
+                sub_weight = 5.0
+                self._total_pct  = min(
+                    sub_weight * (self._sub_done / max(self._n_subs, 1))
+                    + sub_weight / max(self._n_subs, 1) * (pct / 100),
+                    sub_weight,
+                )
+                self._total_eta  = ""
+
+            else:
+                self._phase      = "video"
+                self._video_bytes = downloaded
+                self._video_total = total
+                self._step_label = "Vidéo"
+                self._step_pct   = pct
+                self._step_eta   = eta_str
+                self._step_spd   = spd_str
+                # Total : subs = 5 %, vidéo = 95 %
+                sub_done_pct = 5.0
+                self._total_pct  = sub_done_pct + 95.0 * pct / 100
+                self._total_eta  = eta_str
+
+        elif status == "finished":
+            if is_sub:
+                self._sub_done  += 1
+                self._step_pct   = 100.0
+            else:
+                self._phase      = "merge"
+                self._step_label = "Combinaison vidéo + audio + sous-titres"
+                self._step_pct   = 0.0
+                self._step_eta   = ""
+                self._step_spd   = ""
+                self._total_pct  = 95.0
+                self._total_eta  = ""
+
+        elif status == "error":
+            pass  # erreurs gérées par _Logger, on n'interrompt pas le rendu
+
+        self._render()
+
+    def on_postprocessor(self, d: dict) -> None:
+        """Appelé à chaque tick du postprocesseur (merge, embed subs…)."""
+        status = d.get("status", "")
+        if status == "started":
+            pp = d.get("postprocessor", "")
+            if "Merge" in pp or "EmbedSubtitle" in pp or "Metadata" in pp:
+                self._phase      = "merge"
+                self._step_label = "Combinaison vidéo + audio + sous-titres"
+                self._step_pct   = 50.0
+                self._step_eta   = "en cours"
+                self._step_spd   = ""
+                self._total_pct  = 97.0
+                self._render()
+        elif status == "finished":
+            self._step_pct  = 100.0
+            self._total_pct = 100.0
+            self._step_eta  = ""
+            self._total_eta = ""
+            self._render()
+
+    # ── Rendu terminal ────────────────────────────────────────────────────────
+
+    def _render(self) -> None:  # pylint: disable=too-many-locals
+        """Réécrit les 4 lignes de progression sur place.
+
+        Utilise \033[K (erase to end of line) pour effacer les résidus
+        de texte plus long de la ligne précédente (évite les artefacts).
+        """
+        import sys  # pylint: disable=import-outside-toplevel
+
+        C   = self._CYAN
+        G   = self._GREEN
+        Y   = self._YELLOW
+        B   = self._BOLD
+        D   = self._DIM
+        R   = self._RESET
+        UP  = self._UP
+        EL  = "\033[K"   # Erase to end of Line — efface les résidus
+        W   = 58
+
+        # ── Ligne 1 : TOTAL ─────────────────────────────────────────────────
+        total_bar = self._bar(self._total_pct, self._BAR_W)
+        total_eta = f"  ETA {self._total_eta}" if self._total_eta else ""
+        l1 = (
+            f"  {B}TOTAL{R}  "
+            f"{C}[{total_bar}]{R}  "
+            f"{B}{self._total_pct:5.1f}%{R}"
+            f"{D}{total_eta}{R}{EL}"
+        )
+
+        # ── Ligne 2 : Séparateur ─────────────────────────────────────────────
+        l2 = f"  {D}{'─' * W}{R}{EL}"
+
+        # ── Lignes 3-4 : Étape (label + barre) ──────────────────────────────
+        step_bar = self._bar(self._step_pct, self._BAR_W)
+        # ETA et vitesse sont stockés séparément pour éviter les artefacts
+        step_extra = ""
+        if self._step_eta:
+            step_extra = f"  ETA {self._step_eta}"
+        if self._step_spd:
+            step_extra += f"  {self._step_spd}"
+
+        color = Y if self._phase == "subs" else (G if self._phase == "video" else C)
+        l3 = (
+            f"  {color}{self._step_label}{R}{EL}\n"
+            f"  {color}[{step_bar}]{R}  "
+            f"{B}{self._step_pct:5.1f}%{R}"
+            f"{D}{step_extra}{R}{EL}"
+        )
+
+        if not self._printed:
+            sys.stdout.write(f"\n{l1}\n{l2}\n{l3}\n")
+            self._printed = True
+        else:
+            # 4 lignes à remonter : l1, l2, label, barre
+            sys.stdout.write(f"{UP}{UP}{UP}{UP}\r{l1}\n{l2}\n{l3}\n")
+
+        sys.stdout.flush()
+
+    def finish(self) -> None:
+        """Affiche l'état final (100 %) et saute une ligne."""
+        import sys  # pylint: disable=import-outside-toplevel
+        self._total_pct  = 100.0
+        self._step_pct   = 100.0
+        self._step_eta   = ""
+        self._total_eta  = ""
+        if self._phase != "merge":
+            self._step_label = "Terminé"
+            self._phase      = "merge"
+        self._render()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Téléchargement principal
+# ─────────────────────────────────────────────────────────────────────────────
+def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     """Télécharge la vidéo en MP4 (meilleure qualité).
     - Sous-titres manuels intégrés dans le MP4 (sélectionnables dans VLC)
+    - Progression en temps réel sur 4 lignes fixes (pas de scroll)
     - Téléchargement dans .cotube_tmp/, un seul MP4 déplacé vers dest_dir
     - Nettoyage complet du dossier temp à la fin
     """
-    import yt_dlp
+    import yt_dlp  # pylint: disable=import-outside-toplevel
 
     os.makedirs(dest_dir, exist_ok=True)
-
     tmp_dir = os.path.join(dest_dir, ".cotube_tmp")
-    # Repartir d'un temp propre à chaque fois
     shutil.rmtree(tmp_dir, ignore_errors=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    class _Logger:
-        def debug(self, msg):
-            if msg.startswith("[download]"):
-                print(msg)
-        def warning(self, msg):
-            pass
-        def error(self, msg):
-            if "429" in msg:
-                print(f"  \033[33m⚠  Ignoré (429) : {msg[:80]}\033[0m")
-            else:
-                print(f"  \033[31m✖  {msg}\033[0m")
+    # ── Logger silencieux sauf 429 ────────────────────────────────────────────
+    class _Logger:  # pylint: disable=too-few-public-methods
+        """Logger yt-dlp : silence sauf erreurs non-429."""
+        def debug(self, msg):    # pylint: disable=no-self-use
+            """Silence."""
+        def warning(self, msg):  # pylint: disable=no-self-use
+            """Silence."""
+        def error(self, msg):    # pylint: disable=no-self-use
+            """Affiche uniquement les erreurs non-429."""
+            if "429" not in msg:
+                print(f"\n  \033[31m✖  {msg}\033[0m")
 
     # ─────────────────────────────────────────────────────────────────────────
     # MODE AUDIO : MP3 simple
     # ─────────────────────────────────────────────────────────────────────────
     if mode == "audio":
         label = "Audio MP3"
+        renderer = _DownloadRenderer(n_subs=0, titre="Audio")
         ydl_opts = {
-            "format":       "bestaudio/best",
-            "outtmpl":      os.path.join(tmp_dir, "%(title)s.%(ext)s"),
-            "noplaylist":   True,
-            "logger":       _Logger(),
-            "quiet":        True,
-            "no_warnings":  True,
+            "format":          "bestaudio/best",
+            "outtmpl":         os.path.join(tmp_dir, "%(title)s.%(ext)s"),
+            "noplaylist":      True,
+            "logger":          _Logger(),
+            "quiet":           True,
+            "no_warnings":     True,
+            "progress_hooks":  [renderer.on_progress],
+            "postprocessor_hooks": [renderer.on_postprocessor],
         }
         if ffmpeg_exe:
             ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
@@ -726,15 +970,17 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
         print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
         print(f"  {ConsoleUI.BOLD}TÉLÉCHARGEMENT EN COURS — {label}{ConsoleUI.RESET}")
         print(f"  {ConsoleUI.DIM}Destination : {dest_dir}{ConsoleUI.RESET}")
-        print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
+        print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
         _apply_cookies(ydl_opts, cfg, verbose=True)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as exc:
+            print()
             ConsoleUI.result_screen([f"  {ConsoleUI.RED}✖  Erreur : {exc}{ConsoleUI.RESET}"])
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return
+        renderer.finish()
         _finalise(tmp_dir, dest_dir, mode, label, ConsoleUI)
         return
 
@@ -757,17 +1003,15 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
         if ffmpeg_exe:
             info_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
         _apply_cookies(info_opts, cfg)
-
         with yt_dlp.YoutubeDL(info_opts) as ydl_q:
             info = ydl_q.extract_info(url, download=False)
-
-        titre = info.get("title", "video")
-        duree = info.get("duration", 0)
-        m, s  = divmod(int(duree), 60)
+        titre            = info.get("title", "video")
+        duree            = info.get("duration", 0)
+        m_dur, s_dur     = divmod(int(duree), 60)
         manual_sub_langs = sorted((info.get("subtitles") or {}).keys())
 
         ConsoleUI.info(f"Titre       : {titre}")
-        ConsoleUI.info(f"Durée       : {m}m {s:02d}s")
+        ConsoleUI.info(f"Durée       : {m_dur}m {s_dur:02d}s")
         if manual_sub_langs:
             preview = manual_sub_langs[:10]
             more    = len(manual_sub_langs) - len(preview)
@@ -780,15 +1024,50 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
         else:
             ConsoleUI.info("Sous-titres : aucun sous-titre manuel")
         ConsoleUI.sep()
-
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-except
         ConsoleUI.warn(f"Analyse partielle ({exc}) — format par défaut.")
 
-    label = "MP4 — meilleure qualité + sous-titres intégrés"
+    # ── Question : voulez-vous les sous-titres ? ─────────────────────────────
+    want_subs = False
+    if manual_sub_langs:
+        n_sub = len(manual_sub_langs)
+        if n_sub <= 5:
+            speed_hint = f"{ConsoleUI.GREEN}rapide{ConsoleUI.RESET}"
+        elif n_sub >= 10:
+            speed_hint = f"{ConsoleUI.YELLOW}peut être assez long{ConsoleUI.RESET}"
+        else:
+            speed_hint = f"{ConsoleUI.DIM}durée modérée{ConsoleUI.RESET}"
 
-    # Étape 2 — Options yt-dlp
+        sub_note = (
+            f"{n_sub} langue(s) disponible(s) — {speed_hint}"
+        )
+        idx_sub = ConsoleUI.navigate(
+            [
+                f"✅  Oui — intégrer les sous-titres  ({sub_note})",
+                "❌  Non — vidéo seule (plus rapide)",
+            ],
+            "SOUS-TITRES",
+            "Les sous-titres seront sélectionnables dans VLC"
+        )
+        want_subs = (idx_sub == 0)
+    # Pas de sous-titres disponibles → want_subs reste False
+
+    if want_subs:
+        label = "MP4 — meilleure qualité + sous-titres intégrés"
+    else:
+        label = "MP4 — meilleure qualité"
+
+    # Étape 2 — Renderer de progression
+    renderer = _DownloadRenderer(
+        n_subs=len(manual_sub_langs) if want_subs else 0,
+        titre=titre,
+    )
+
+    # Étape 3 — Options yt-dlp
+    base_pp = [{"key": "FFmpegMetadata", "add_metadata": True}]
+    sub_pp  = [{"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False}]
+
     ydl_opts = {
-        # Meilleure vidéo mp4 + meilleur audio m4a → merge en mp4 sans reencoder
         "format":               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "outtmpl":              os.path.join(tmp_dir, "%(title)s.%(ext)s"),
         "noplaylist":           True,
@@ -796,33 +1075,30 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
         "quiet":                True,
         "no_warnings":          True,
         "merge_output_format":  "mp4",
-        "ignoreerrors":         True,       # ne jamais crasher sur erreur de sub
-        # Sous-titres manuels seulement (pas les 150 auto-générés)
-        "writesubtitles":       True,
+        "ignoreerrors":         True,
+        "writesubtitles":       want_subs,
         "writeautomaticsub":    False,
-        "subtitleslangs":       ["all"],
-        "postprocessors": [
-            # Convertit et intègre les subs dans le MP4 (format mov_text)
-            {"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False},
-            {"key": "FFmpegMetadata",       "add_metadata": True},
-        ],
-        # Supprime les fichiers .vtt/.srt séparés après intégration
+        "subtitleslangs":       ["all"] if want_subs else [],
         "keepvideo":            False,
+        "progress_hooks":       [renderer.on_progress],
+        "postprocessor_hooks":  [renderer.on_postprocessor],
+        "postprocessors":       (sub_pp + base_pp) if want_subs else base_pp,
     }
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
     _apply_cookies(ydl_opts, cfg, verbose=True)
 
-    print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
+    print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.BOLD}TÉLÉCHARGEMENT EN COURS{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.DIM}Format  : {label}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.DIM}Sortie  : {dest_dir}{ConsoleUI.RESET}")
-    print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
+    print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
 
-    # Étape 3 — Téléchargement (ignoreerrors → jamais de crash)
+    # Étape 4 — Téléchargement
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
+    renderer.finish()
     _finalise(tmp_dir, dest_dir, mode, label, ConsoleUI)
 
 
