@@ -702,8 +702,11 @@ class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
 
     _BAR_W  = 30         # largeur de la barre de progression
 
-    def __init__(self, n_subs: int, titre: str) -> None:
-        self._n_subs         = n_subs       # nb total de langues de sous-titres
+    def __init__(self, n_subs: int, titre: str,
+                 want_subs: bool = False, audio_mode: bool = False) -> None:
+        self._n_subs         = n_subs
+        self._want_subs      = want_subs
+        self._audio_mode     = audio_mode    # True = MP3 (pas de merge vidéo)
         self._titre          = titre[:50]
         self._total_pct      = 0.0          # % total (0-100)
         self._total_eta      = ""
@@ -715,6 +718,8 @@ class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
         self._printed        = False        # True après le premier rendu
         self._phase          = "init"       # "subs" | "video" | "merge"
         self._video_bytes    = 0            # octets vidéo téléchargés
+        self._merge_start    = 0.0          # timestamp début merge
+        self._merge_thread   = None         # thread animation merge
         self._video_total    = 0            # octets vidéo totaux
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -791,17 +796,15 @@ class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
                 self._total_eta  = ""
 
             else:
-                self._phase      = "video"
+                self._phase       = "audio" if self._audio_mode else "video"
                 self._video_bytes = downloaded
                 self._video_total = total
-                self._step_label = "Vidéo"
-                self._step_pct   = pct
-                self._step_eta   = eta_str
-                self._step_spd   = spd_str
-                # Total : subs = 5 %, vidéo = 95 %
-                sub_done_pct = 5.0
-                self._total_pct  = sub_done_pct + 95.0 * pct / 100
-                self._total_eta  = eta_str
+                self._step_label  = "Audio" if self._audio_mode else "Vidéo"
+                self._step_pct    = pct
+                self._step_eta    = eta_str
+                self._step_spd    = spd_str
+                self._total_pct   = pct   # audio = 100 % du total
+                self._total_eta   = eta_str
 
         elif status == "finished":
             if is_sub:
@@ -809,11 +812,16 @@ class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
                 self._step_pct   = 100.0
             else:
                 self._phase      = "merge"
-                self._step_label = "Combinaison vidéo + audio + sous-titres"
+                if self._audio_mode:
+                    self._step_label = "Conversion en MP3"
+                elif self._want_subs:
+                    self._step_label = "Combinaison vidéo + audio + sous-titres"
+                else:
+                    self._step_label = "Combinaison vidéo + audio"
                 self._step_pct   = 0.0
                 self._step_eta   = ""
                 self._step_spd   = ""
-                self._total_pct  = 95.0
+                self._total_pct  = 95.0 if not self._audio_mode else 98.0
                 self._total_eta  = ""
 
         elif status == "error":
@@ -821,25 +829,74 @@ class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
 
         self._render()
 
-    def on_postprocessor(self, d: dict) -> None:
-        """Appelé à chaque tick du postprocesseur (merge, embed subs…)."""
+    def on_postprocessor(self, d: dict) -> None:  # pylint: disable=too-many-branches
+        """Appelé au début et à la fin de chaque postprocesseur.
+
+        yt-dlp ne remonte pas de progression intermédiaire pendant ffmpeg :
+        on reçoit uniquement "started" puis "finished".
+        → On lance un thread qui anime la barre en fonction du temps écoulé.
+        """
+        import threading  # pylint: disable=import-outside-toplevel
         status = d.get("status", "")
         if status == "started":
             pp = d.get("postprocessor", "")
-            if "Merge" in pp or "EmbedSubtitle" in pp or "Metadata" in pp:
+            if "Merge" in pp or "EmbedSubtitle" in pp or "Metadata" in pp \
+                    or "ExtractAudio" in pp:
                 self._phase      = "merge"
-                self._step_label = "Combinaison vidéo + audio + sous-titres"
-                self._step_pct   = 50.0
-                self._step_eta   = "en cours"
+                if self._audio_mode:
+                    self._step_label = "Conversion en MP3"
+                elif self._want_subs:
+                    self._step_label = "Combinaison vidéo + audio + sous-titres"
+                else:
+                    self._step_label = "Combinaison vidéo + audio"
                 self._step_spd   = ""
-                self._total_pct  = 97.0
-                self._render()
+                self._merge_start = time.monotonic()
+                # Lance le thread d'animation (s'arrête seul quand merge fini)
+                self._merge_thread = threading.Thread(
+                    target=self._animate_merge, daemon=True
+                )
+                self._merge_thread.start()
         elif status == "finished":
+            # Arrêter l'animation et afficher 100 %
+            self._merge_start = 0.0   # signal d'arrêt pour le thread
+            if self._merge_thread and self._merge_thread.is_alive():
+                self._merge_thread.join(timeout=2)
             self._step_pct  = 100.0
             self._total_pct = 100.0
             self._step_eta  = ""
             self._total_eta = ""
             self._render()
+
+    # ── Animation merge ──────────────────────────────────────────────────────
+
+    def _animate_merge(self) -> None:
+        """Thread daemon : anime la barre de merge basé sur le temps écoulé.
+
+        Sans info réelle de ffmpeg, on simule une progression logarithmique
+        qui démarre vite puis ralentit (réaliste pour un stream copy).
+        S'arrête quand _merge_start est remis à 0 (signal "finished").
+        """
+        # Durée estimée : ~2s pour stream copy, ~30s si re-encode
+        # On monte jusqu'à 95 % max, jamais 100 % (réservé au finished)
+        while self._merge_start > 0:
+            elapsed = time.monotonic() - self._merge_start
+            # Progression logarithmique : monte vite au début, plafonne vers 95 %
+            # log(1 + elapsed) / log(1 + ref) capped à 0.95
+            ref = 15.0  # secondes de référence pour atteindre ~80 %
+            import math  # pylint: disable=import-outside-toplevel
+            raw = math.log(1 + elapsed) / math.log(1 + ref)
+            pct = min(raw * 95.0, 95.0)
+            self._step_pct  = pct
+            # Total : 95 % (fin vidéo) → 99 % progressivement
+            self._total_pct = 95.0 + pct / 95.0 * 4.0
+            # ETA estimée
+            if pct < 90:
+                remaining = ref * math.exp((1 - pct / 95.0) * math.log(1 + ref)) - 1
+                self._step_eta = self._fmt_eta(max(0, remaining - elapsed))
+            else:
+                self._step_eta = ""
+            self._render()
+            time.sleep(0.25)
 
     # ── Rendu terminal ────────────────────────────────────────────────────────
 
@@ -883,7 +940,11 @@ class _DownloadRenderer:  # pylint: disable=too-many-instance-attributes
         if self._step_spd:
             step_extra += f"  {self._step_spd}"
 
-        color = Y if self._phase == "subs" else (G if self._phase == "video" else C)
+        color = (
+            Y if self._phase == "subs"
+            else G if self._phase in ("video", "audio")
+            else C
+        )
         l3 = (
             f"  {color}{self._step_label}{R}{EL}\n"
             f"  {color}[{step_bar}]{R}  "
@@ -949,7 +1010,7 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):  # pylint: disable=too-ma
     # ─────────────────────────────────────────────────────────────────────────
     if mode == "audio":
         label = "Audio MP3"
-        renderer = _DownloadRenderer(n_subs=0, titre="Audio")
+        renderer = _DownloadRenderer(n_subs=0, titre="Audio", audio_mode=True)
         ydl_opts = {
             "format":          "bestaudio/best",
             "outtmpl":         os.path.join(tmp_dir, "%(title)s.%(ext)s"),
@@ -965,10 +1026,32 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):  # pylint: disable=too-ma
             ydl_opts["postprocessors"]  = [{"key": "FFmpegExtractAudio",
                                             "preferredcodec": "mp3",
                                             "preferredquality": "192"}]
+        # Récupération rapide du titre pour l'affichage
+        audio_titre = ""
+        audio_duree = ""
+        try:
+            _info_opts = {"quiet": True, "no_warnings": True, "logger": _Logger()}
+            if ffmpeg_exe:
+                _info_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
+            _apply_cookies(_info_opts, cfg)
+            with yt_dlp.YoutubeDL(_info_opts) as _ydl_q:
+                _info = _ydl_q.extract_info(url, download=False)
+            audio_titre = _info.get("title", "")[:55]
+            _dur = _info.get("duration", 0)
+            _m, _s = divmod(int(_dur), 60)
+            audio_duree = f"{_m}m {_s:02d}s"
+            renderer._titre = audio_titre  # pylint: disable=protected-access
+        except Exception:  # pylint: disable=broad-except
+            pass
+
         ConsoleUI.clear()
         print(ConsoleUI.BANNER)
         print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
         print(f"  {ConsoleUI.BOLD}TÉLÉCHARGEMENT EN COURS — {label}{ConsoleUI.RESET}")
+        if audio_titre:
+            print(f"  {ConsoleUI.DIM}Titre       : {audio_titre}{ConsoleUI.RESET}")
+        if audio_duree:
+            print(f"  {ConsoleUI.DIM}Durée       : {audio_duree}{ConsoleUI.RESET}")
         print(f"  {ConsoleUI.DIM}Destination : {dest_dir}{ConsoleUI.RESET}")
         print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
         _apply_cookies(ydl_opts, cfg, verbose=True)
@@ -1027,30 +1110,8 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):  # pylint: disable=too-ma
     except Exception as exc:  # pylint: disable=broad-except
         ConsoleUI.warn(f"Analyse partielle ({exc}) — format par défaut.")
 
-    # ── Question : voulez-vous les sous-titres ? ─────────────────────────────
-    want_subs = False
-    if manual_sub_langs:
-        n_sub = len(manual_sub_langs)
-        if n_sub <= 5:
-            speed_hint = f"{ConsoleUI.GREEN}rapide{ConsoleUI.RESET}"
-        elif n_sub >= 10:
-            speed_hint = f"{ConsoleUI.YELLOW}peut être assez long{ConsoleUI.RESET}"
-        else:
-            speed_hint = f"{ConsoleUI.DIM}durée modérée{ConsoleUI.RESET}"
-
-        sub_note = (
-            f"{n_sub} langue(s) disponible(s) — {speed_hint}"
-        )
-        idx_sub = ConsoleUI.navigate(
-            [
-                f"✅  Oui — intégrer les sous-titres  ({sub_note})",
-                "❌  Non — vidéo seule (plus rapide)",
-            ],
-            "SOUS-TITRES",
-            "Les sous-titres seront sélectionnables dans VLC"
-        )
-        want_subs = (idx_sub == 0)
-    # Pas de sous-titres disponibles → want_subs reste False
+    # Sous-titres toujours activés si disponibles
+    want_subs = bool(manual_sub_langs)
 
     if want_subs:
         label = "MP4 — meilleure qualité + sous-titres intégrés"
@@ -1059,16 +1120,18 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):  # pylint: disable=too-ma
 
     # Étape 2 — Renderer de progression
     renderer = _DownloadRenderer(
-        n_subs=len(manual_sub_langs) if want_subs else 0,
+        n_subs=len(manual_sub_langs),
         titre=titre,
+        want_subs=want_subs,
     )
 
     # Étape 3 — Options yt-dlp
-    base_pp = [{"key": "FFmpegMetadata", "add_metadata": True}]
     sub_pp  = [{"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False}]
 
     ydl_opts = {
-        "format":               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        # Priorité : deux streams séparés (meilleure qualité) → stream copy
+        # Fallback : format déjà muxé mp4 (aucun merge nécessaire)
+        "format":               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl":              os.path.join(tmp_dir, "%(title)s.%(ext)s"),
         "noplaylist":           True,
         "logger":               _Logger(),
@@ -1080,9 +1143,11 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):  # pylint: disable=too-ma
         "writeautomaticsub":    False,
         "subtitleslangs":       ["all"] if want_subs else [],
         "keepvideo":            False,
+        # stream copy : ffmpeg copie les streams sans réencoder → quasi instantané
+        "postprocessor_args":   {"merger": ["-c", "copy"]},
         "progress_hooks":       [renderer.on_progress],
         "postprocessor_hooks":  [renderer.on_postprocessor],
-        "postprocessors":       (sub_pp + base_pp) if want_subs else base_pp,
+        "postprocessors":       sub_pp if want_subs else [],
     }
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
