@@ -1,5 +1,5 @@
 # pylint: disable=line-too-long,too-many-lines
-"""YT-DL — Téléchargeur de vidéos YouTube avec interface style CO-FLIX."""
+"""YT-DL — Téléchargeur de vidéos YouTube avec interface style CO-FLIX + cookies navigateur."""
 
 import os
 import sys
@@ -28,13 +28,37 @@ try:
 except ImportError:
     tty = termios = select = None  # pylint: disable=invalid-name
 
-VERSION = "1.0"
+VERSION = "1.1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigateurs supportés pour l'extraction de cookies
+# ─────────────────────────────────────────────────────────────────────────────
+BROWSERS = [
+    "chrome",
+    "firefox",
+    "edge",
+    "brave",
+    "opera",
+    "chromium",
+    "vivaldi",
+    "safari",
+]
+
+BROWSER_LABELS = {
+    "chrome":   "🌐  Google Chrome",
+    "firefox":  "🦊  Mozilla Firefox",
+    "edge":     "🔷  Microsoft Edge",
+    "brave":    "🦁  Brave",
+    "opera":    "🎭  Opera",
+    "chromium": "🔵  Chromium",
+    "vivaldi":  "🎻  Vivaldi",
+    "safari":   "🧭  Safari  (macOS uniquement)",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Détection environnement
 # ─────────────────────────────────────────────────────────────────────────────
 def _is_termux():
-    """Retourne True si on tourne dans Termux (Android)."""
     return (os.name != "nt" and (
         "ANDROID_STORAGE" in os.environ
         or "com.termux" in os.environ.get("PREFIX", "")
@@ -42,19 +66,16 @@ def _is_termux():
 
 
 def _base_dir():
-    """Retourne le dossier de base du script (ou de l'exécutable)."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def _config_path():
-    """Retourne le chemin du fichier de config JSON."""
     return os.path.join(_base_dir(), "ytdl_config.json")
 
 
 def _load_config():
-    """Charge la config. Retourne un dict (vide si absent/corrompu)."""
     try:
         with open(_config_path(), encoding="utf-8") as _f:
             return _json.load(_f)
@@ -63,7 +84,6 @@ def _load_config():
 
 
 def _save_config(data):
-    """Sauvegarde la config (merge avec l'existant)."""
     try:
         existing = _load_config()
         existing.update(data)
@@ -77,7 +97,6 @@ def _save_config(data):
 # Installation automatique des dépendances
 # ─────────────────────────────────────────────────────────────────────────────
 def _install_if_missing(package, pip_name=None):
-    """Installe un paquet pip si non présent."""
     pip_name = pip_name or package
     try:
         __import__(package)
@@ -92,7 +111,6 @@ def _install_if_missing(package, pip_name=None):
 
 
 def setup_dependencies():
-    """Installe yt-dlp et imageio-ffmpeg si nécessaire."""
     _install_if_missing("yt_dlp", "yt-dlp")
     _install_if_missing("imageio_ffmpeg", "imageio-ffmpeg")
 
@@ -101,32 +119,22 @@ def setup_dependencies():
 # FFmpeg — résolution du binaire
 # ─────────────────────────────────────────────────────────────────────────────
 def setup_ffmpeg():
-    """
-    Retourne le chemin complet vers un ffmpeg utilisable par yt-dlp.
-    Priorité : PATH système → imageio-ffmpeg (copié sous le bon nom).
-    """
     exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
 
-    # 1. ffmpeg dans le PATH
     found = shutil.which("ffmpeg")
     if found:
         return found
 
-    # 2. imageio-ffmpeg — binaire embarqué (nom non standard → on le copie)
     try:
         import imageio_ffmpeg  # pylint: disable=import-outside-toplevel
         src = imageio_ffmpeg.get_ffmpeg_exe()
-
         tmp_dir = os.path.join(tempfile.gettempdir(), "ytdl_ffmpeg")
         os.makedirs(tmp_dir, exist_ok=True)
         dst = os.path.join(tmp_dir, exe_name)
-
-        # Copie uniquement si nécessaire
         if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
             shutil.copy2(src, dst)
             if os.name != "nt":
                 os.chmod(dst, 0o755)
-
         return dst
     except Exception:  # pylint: disable=broad-except
         pass
@@ -135,11 +143,9 @@ def setup_ffmpeg():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ConsoleUI — interface identique à CO-FLIX
+# ConsoleUI
 # ─────────────────────────────────────────────────────────────────────────────
 class ConsoleUI:
-    """Utilitaires d'interface console avec couleurs ANSI et navigation clavier."""
-
     RESET  = '\033[0m'
     BOLD   = '\033[1m'
     DIM    = '\033[2m'
@@ -158,7 +164,7 @@ class ConsoleUI:
 ║  ╚██████╗╚██████╔╝         ██║   ╚██████╔╝██████╔╝███████╗   ║
 ║   ╚═════╝ ╚═════╝          ╚═╝    ╚═════╝ ╚═════╝ ╚══════╝   ║
 ║                                                              ║
-║            🎬  CO-TUBE  DOWNLOADER  🎬                       ║
+║            🎬  CO-TUBE  DOWNLOADER  v1.1  🎬                 ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝""" + RESET
 
@@ -166,7 +172,6 @@ class ConsoleUI:
 
     @staticmethod
     def enable_ansi():
-        """Active le support ANSI sur Windows."""
         if os.name == "nt":
             try:
                 kernel32 = ctypes.windll.kernel32
@@ -176,12 +181,10 @@ class ConsoleUI:
 
     @staticmethod
     def clear():
-        """Efface la console."""
         os.system("cls" if os.name == "nt" else "clear")
 
     @staticmethod
     def display_len(s):
-        """Retourne la largeur visuelle réelle d'une chaîne (emojis = 2)."""
         count = 0
         for ch in s:
             cp = ord(ch)
@@ -202,7 +205,6 @@ class ConsoleUI:
 
     @staticmethod
     def show_menu(options, title="MENU", selected_index=0, subtitle=""):  # pylint: disable=too-many-locals
-        """Affiche le menu interactif avec navigation clavier."""
         box_w = 62
         ConsoleUI.clear()
         print(ConsoleUI.BANNER)
@@ -272,7 +274,6 @@ class ConsoleUI:
 
     @staticmethod
     def show_menu_termux(options, title="MENU", subtitle=""):
-        """Affiche le menu numéroté pour Termux."""
         ConsoleUI.clear()
         print(f"{ConsoleUI.CYAN}\n  {'═'*54}{ConsoleUI.RESET}")
         print(f"  {ConsoleUI.BOLD}{ConsoleUI.CYAN}🎬  CO-TUBE  —  {title}{ConsoleUI.RESET}")
@@ -286,7 +287,6 @@ class ConsoleUI:
 
     @staticmethod
     def get_key():  # pylint: disable=too-many-return-statements,too-many-branches
-        """Lit une touche (UP/DOWN/ENTER/ESC) sans bloquer."""
         if os.name == "nt":
             if msvcrt.kbhit():
                 key = msvcrt.getch()
@@ -326,7 +326,6 @@ class ConsoleUI:
 
     @staticmethod
     def flush_keys():
-        """Vide le buffer clavier."""
         if os.name == "nt":
             while msvcrt.kbhit():
                 msvcrt.getch()
@@ -338,7 +337,6 @@ class ConsoleUI:
 
     @staticmethod
     def navigate(options, title="MENU", subtitle=""):  # pylint: disable=too-many-branches
-        """Navigue dans un menu (flèches sur PC, chiffres sur Termux)."""
         if not options:
             return -1
         if _is_termux():
@@ -376,7 +374,6 @@ class ConsoleUI:
 
     @staticmethod
     def input_screen(title, prompt_text, subtitle=""):
-        """Affiche un écran de saisie et retourne la valeur entrée."""
         ConsoleUI.clear()
         print(ConsoleUI.BANNER)
         print(f"\n  {ConsoleUI.CYAN}{ConsoleUI.BOLD}{'─'*58}{ConsoleUI.RESET}")
@@ -391,7 +388,6 @@ class ConsoleUI:
 
     @staticmethod
     def result_screen(lines, pause=True):
-        """Affiche un écran de résultat."""
         ConsoleUI.clear()
         print(ConsoleUI.CYAN + "\n  " + "═"*58 + ConsoleUI.RESET)
         for line in lines:
@@ -405,7 +401,6 @@ class ConsoleUI:
 
     @staticmethod
     def loading_screen(title, duration=1.5):
-        """Affiche un écran de chargement animé."""
         ConsoleUI.clear()
         print(ConsoleUI.BANNER)
         print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
@@ -428,32 +423,97 @@ class ConsoleUI:
 
     @staticmethod
     def info(m):
-        """Affiche un message informatif."""
         print(f"  {ConsoleUI.CYAN}ℹ  {ConsoleUI.RESET}{m}")
 
     @staticmethod
     def success(m):
-        """Affiche un message de succès."""
         print(f"  {ConsoleUI.GREEN}✔  {ConsoleUI.RESET}{m}")
 
     @staticmethod
     def warn(m):
-        """Affiche un avertissement."""
         print(f"  {ConsoleUI.YELLOW}⚠  {ConsoleUI.RESET}{m}")
 
     @staticmethod
     def sep():
-        """Affiche un séparateur."""
         print(f"\n  {ConsoleUI.DIM}{'─'*54}{ConsoleUI.RESET}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cookies — helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _cookie_summary(cfg):
+    """
+    Retourne un résumé lisible de la config cookies active.
+    Priorité : fichier cookies.txt > navigateur > aucun.
+    """
+    cookie_file    = cfg.get("cookie_file", "")
+    cookie_browser = cfg.get("cookie_browser", "")
+
+    if cookie_file and os.path.isfile(cookie_file):
+        return f"📄  Fichier : {os.path.basename(cookie_file)}"
+    if cookie_browser:
+        label = BROWSER_LABELS.get(cookie_browser, cookie_browser)
+        return f"🍪  Navigateur : {label}"
+    return f"{ConsoleUI.DIM}Aucun (vidéos publiques uniquement){ConsoleUI.RESET}"
+
+
+def _apply_cookies(ydl_opts, cfg):
+    """
+    Injecte les paramètres cookies dans les opts yt-dlp.
+    Priorité : fichier > navigateur.
+    """
+    cookie_file    = cfg.get("cookie_file", "")
+    cookie_browser = cfg.get("cookie_browser", "")
+
+    if cookie_file and os.path.isfile(cookie_file):
+        ydl_opts["cookiefile"] = cookie_file
+        return "fichier"
+
+    if cookie_browser:
+        # yt-dlp attend un tuple (navigateur, profil_optionnel)
+        ydl_opts["cookiesfrombrowser"] = (cookie_browser, None, None, None)
+        return cookie_browser
+
+    return None
+
+
+def _test_cookies(cfg, ffmpeg_exe):  # pylint: disable=too-many-branches
+    """
+    Teste les cookies en essayant d'extraire les métadonnées d'une vidéo
+    YouTube publique. Retourne (ok: bool, message: str).
+    """
+    import yt_dlp  # pylint: disable=import-outside-toplevel
+
+    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    if ffmpeg_exe:
+        opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
+
+    source = _apply_cookies(opts, cfg)
+    if not source:
+        return False, "Aucun cookie configuré."
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(test_url, download=False)
+        return True, f"Cookies opérationnels ({source})."
+    except Exception as e:  # pylint: disable=broad-except
+        return False, str(e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Téléchargement
 # ─────────────────────────────────────────────────────────────────────────────
-def do_download(url, mode, dest_dir, ffmpeg_exe):
+def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
     """
     Télécharge une vidéo YouTube via yt-dlp.
     mode : "video" | "audio"
+    cfg  : dict de configuration (pour les cookies)
     """
     import yt_dlp  # pylint: disable=import-outside-toplevel
 
@@ -469,23 +529,20 @@ def do_download(url, mode, dest_dir, ffmpeg_exe):
         label = "Meilleure qualité"
 
     class _DownloadLogger:  # pylint: disable=too-few-public-methods
-        """Logger yt-dlp : affiche uniquement les lignes [download]."""
         def debug(self, msg):
-            """Affiche uniquement la progression du téléchargement."""
             if msg.startswith("[download]"):
                 print(msg)
         def warning(self, msg):  # pylint: disable=unused-argument
-            """Supprime les avertissements."""
+            pass
         def error(self, msg):
-            """Affiche les erreurs."""
             print(f"  \033[31m✖  {msg}\033[0m")
 
     ydl_opts = {
-        "format":    fmt,
-        "outtmpl":   os.path.join(dest_dir, "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "logger":    _DownloadLogger(),
-        "quiet":     True,
+        "format":      fmt,
+        "outtmpl":     os.path.join(dest_dir, "%(title)s.%(ext)s"),
+        "noplaylist":  True,
+        "logger":      _DownloadLogger(),
+        "quiet":       True,
         "no_warnings": True,
     }
 
@@ -500,17 +557,31 @@ def do_download(url, mode, dest_dir, ffmpeg_exe):
         else:
             ydl_opts["merge_output_format"] = "mp4"
 
+    # ── Injection des cookies ────────────────────────────────────────────────
+    cookie_source = _apply_cookies(ydl_opts, cfg)
+
     ConsoleUI.clear()
     print(ConsoleUI.BANNER)
     print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.BOLD}TÉLÉCHARGEMENT EN COURS{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.DIM}Format : {label}   —   Destination : {dest_dir}{ConsoleUI.RESET}")
+    if cookie_source:
+        src_label = BROWSER_LABELS.get(cookie_source, cookie_source)
+        print(f"  {ConsoleUI.DIM}Cookies : {src_label}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
 
     # Récupération des infos avant dl
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
-                                "logger": _DownloadLogger()}) as ydl_q:
+        info_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "logger": _DownloadLogger(),
+        }
+        if ffmpeg_exe:
+            info_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
+        _apply_cookies(info_opts, cfg)
+
+        with yt_dlp.YoutubeDL(info_opts) as ydl_q:
             info  = ydl_q.extract_info(url, download=False)
             titre = info.get("title", "Titre inconnu")
             duree = info.get("duration", 0)
@@ -536,8 +607,7 @@ def do_download(url, mode, dest_dir, ffmpeg_exe):
 # ─────────────────────────────────────────────────────────────────────────────
 # Menu téléchargement
 # ─────────────────────────────────────────────────────────────────────────────
-def menu_download(dest_dir, ffmpeg_exe):
-    """Saisie de l'URL puis choix du format."""
+def menu_download(dest_dir, ffmpeg_exe, cfg):
     url = ConsoleUI.input_screen(
         "TÉLÉCHARGER UNE VIDÉO",
         "Collez le lien YouTube",
@@ -553,6 +623,7 @@ def menu_download(dest_dir, ffmpeg_exe):
         ])
         return
 
+    cookie_info = _cookie_summary(cfg)
     choice = ConsoleUI.navigate(
         [
             "🎬  Meilleure qualité  (vidéo + audio, MP4)",
@@ -560,7 +631,7 @@ def menu_download(dest_dir, ffmpeg_exe):
             "🔙  Retour",
         ],
         "CHOISIR LE FORMAT",
-        subtitle=f"URL : {url[:60]}{'…' if len(url) > 60 else ''}",
+        subtitle=f"URL : {url[:55]}{'…' if len(url) > 55 else ''}  |  {cookie_info}",
     )
 
     if choice == 2 or choice == -1:
@@ -569,7 +640,7 @@ def menu_download(dest_dir, ffmpeg_exe):
     mode = "video" if choice == 0 else "audio"
 
     try:
-        do_download(url, mode, dest_dir[0], ffmpeg_exe)
+        do_download(url, mode, dest_dir[0], ffmpeg_exe, cfg)
     except KeyboardInterrupt:
         ConsoleUI.result_screen([
             f"  {ConsoleUI.YELLOW}⚠  Téléchargement annulé.{ConsoleUI.RESET}",
@@ -577,27 +648,156 @@ def menu_download(dest_dir, ffmpeg_exe):
     except Exception as e:  # pylint: disable=broad-except
         ConsoleUI.result_screen([
             f"  {ConsoleUI.RED}✖  Erreur : {e}{ConsoleUI.RESET}",
-            f"  {ConsoleUI.DIM}Vérifiez que la vidéo est publique et que l'URL est correcte.{ConsoleUI.RESET}",
+            f"  {ConsoleUI.DIM}Vérifiez l'URL, la confidentialité de la vidéo,{ConsoleUI.RESET}",
+            f"  {ConsoleUI.DIM}ou configurez les cookies dans Paramètres.{ConsoleUI.RESET}",
         ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Menu cookies
+# ─────────────────────────────────────────────────────────────────────────────
+def menu_cookies(cfg, ffmpeg_exe):  # pylint: disable=too-many-branches,too-many-statements
+    """Sous-menu de gestion des cookies."""
+    while True:
+        cookie_file    = cfg.get("cookie_file", "")
+        cookie_browser = cfg.get("cookie_browser", "")
+        summary        = _cookie_summary(cfg)
+
+        options = [
+            "🌐  Utiliser les cookies d'un navigateur",
+            "📄  Charger un fichier cookies.txt",
+            "🧪  Tester les cookies actuels",
+            "🗑️   Supprimer / désactiver les cookies",
+            "❓  Aide : comment obtenir un cookies.txt ?",
+            "🔙  Retour",
+        ]
+
+        choice = ConsoleUI.navigate(
+            options,
+            "GESTION DES COOKIES",
+            subtitle=f"Actuel : {summary}",
+        )
+
+        # ── Navigateur ────────────────────────────────────────────────────────
+        if choice == 0:
+            browser_opts = [BROWSER_LABELS[b] for b in BROWSERS] + ["🔙  Retour"]
+            b_choice = ConsoleUI.navigate(
+                browser_opts,
+                "CHOISIR LE NAVIGATEUR",
+                subtitle="Le navigateur doit être FERMÉ pour que les cookies soient lisibles.",
+            )
+            if b_choice == -1 or b_choice == len(BROWSERS):
+                continue
+            selected_browser = BROWSERS[b_choice]
+
+            # Vider le fichier s'il était défini (priorité navigateur)
+            cfg["cookie_browser"] = selected_browser
+            cfg.pop("cookie_file", None)
+            _save_config({"cookie_browser": selected_browser, "cookie_file": ""})
+
+            ConsoleUI.result_screen([
+                f"  {ConsoleUI.GREEN}✔  Navigateur sélectionné : {BROWSER_LABELS[selected_browser]}{ConsoleUI.RESET}",
+                f"  {ConsoleUI.YELLOW}⚠  Fermez le navigateur avant de télécharger.{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}yt-dlp lira les cookies directement depuis le profil.{ConsoleUI.RESET}",
+            ])
+
+        # ── Fichier cookies.txt ───────────────────────────────────────────────
+        elif choice == 1:
+            path = ConsoleUI.input_screen(
+                "FICHIER COOKIES.TXT",
+                "Chemin complet vers le fichier",
+                subtitle="Exemple : /home/user/cookies.txt  ou  C:\\Users\\...\\cookies.txt",
+            )
+            if not path:
+                continue
+            path = os.path.expanduser(path.strip('"').strip("'"))
+            if not os.path.isfile(path):
+                ConsoleUI.result_screen([
+                    f"  {ConsoleUI.RED}✖  Fichier introuvable : {path}{ConsoleUI.RESET}",
+                ])
+                continue
+            cfg["cookie_file"] = path
+            cfg.pop("cookie_browser", None)
+            _save_config({"cookie_file": path, "cookie_browser": ""})
+            ConsoleUI.result_screen([
+                f"  {ConsoleUI.GREEN}✔  Fichier cookies chargé !{ConsoleUI.RESET}",
+                f"  {ConsoleUI.CYAN}📄  {path}{ConsoleUI.RESET}",
+            ])
+
+        # ── Test ──────────────────────────────────────────────────────────────
+        elif choice == 2:
+            ConsoleUI.clear()
+            print(ConsoleUI.BANNER)
+            print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
+            print(f"  {ConsoleUI.BOLD}TEST DES COOKIES{ConsoleUI.RESET}")
+            print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
+            ConsoleUI.info("Test en cours (vidéo de test YouTube)...")
+            ok, msg = _test_cookies(cfg, ffmpeg_exe)
+            if ok:
+                ConsoleUI.result_screen([
+                    f"  {ConsoleUI.GREEN}✔  {msg}{ConsoleUI.RESET}",
+                    f"  {ConsoleUI.DIM}Vous pouvez télécharger des vidéos membres / âge restreint.{ConsoleUI.RESET}",
+                ])
+            else:
+                ConsoleUI.result_screen([
+                    f"  {ConsoleUI.RED}✖  Échec du test.{ConsoleUI.RESET}",
+                    f"  {ConsoleUI.DIM}{msg}{ConsoleUI.RESET}",
+                    f"  {ConsoleUI.YELLOW}⚠  Assurez-vous que le navigateur est bien FERMÉ.{ConsoleUI.RESET}",
+                ])
+
+        # ── Supprimer ─────────────────────────────────────────────────────────
+        elif choice == 3:
+            cfg.pop("cookie_browser", None)
+            cfg.pop("cookie_file", None)
+            _save_config({"cookie_browser": "", "cookie_file": ""})
+            ConsoleUI.result_screen([
+                f"  {ConsoleUI.GREEN}✔  Cookies désactivés.{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}Seules les vidéos publiques seront téléchargeables.{ConsoleUI.RESET}",
+            ])
+
+        # ── Aide ──────────────────────────────────────────────────────────────
+        elif choice == 4:
+            ConsoleUI.result_screen([
+                f"  {ConsoleUI.BOLD}{ConsoleUI.CYAN}COMMENT OBTENIR UN FICHIER COOKIES.TXT ?{ConsoleUI.RESET}",
+                "",
+                f"  {ConsoleUI.YELLOW}Option 1 — Extension navigateur (recommandé){ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}Installez 'Get cookies.txt LOCALLY' sur Chrome/Firefox.{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}Connectez-vous à YouTube, exportez les cookies.{ConsoleUI.RESET}",
+                "",
+                f"  {ConsoleUI.YELLOW}Option 2 — Navigateur intégré (plus simple){ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}Sélectionnez votre navigateur dans ce menu.{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}CO-TUBE les lira automatiquement (navigateur fermé !).{ConsoleUI.RESET}",
+                "",
+                f"  {ConsoleUI.YELLOW}Pourquoi des cookies ?{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}• Vidéos membres (YouTube Premium / abonnements){ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}• Vidéos avec restriction d'âge{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}• Limites de débit YouTube (bot-check){ConsoleUI.RESET}",
+            ])
+
+        # ── Retour ────────────────────────────────────────────────────────────
+        elif choice in (5, -1):
+            return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Menu paramètres
 # ─────────────────────────────────────────────────────────────────────────────
-def menu_settings(dest_dir):
+def menu_settings(dest_dir, cfg, ffmpeg_exe):
     """Menu de configuration."""
     while True:
+        cookie_summary = _cookie_summary(cfg)
         choice = ConsoleUI.navigate(
             [
                 "📁  Changer le dossier de téléchargement",
                 "📂  Ouvrir le dossier actuel",
+                f"🍪  Cookies navigateur  [{cookie_summary}]",
                 "🔙  Retour",
             ],
             "PARAMÈTRES",
             subtitle=f"Dossier : {dest_dir[0]}",
         )
 
-        if choice in (-1, 2):
+        if choice in (-1, 3):
             return
 
         if choice == 0:
@@ -632,24 +832,25 @@ def menu_settings(dest_dir):
             except Exception as e:  # pylint: disable=broad-except
                 ConsoleUI.result_screen([f"  {ConsoleUI.RED}✖  {e}{ConsoleUI.RESET}"])
 
+        elif choice == 2:
+            menu_cookies(cfg, ffmpeg_exe)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Point d'entrée
 # ─────────────────────────────────────────────────────────────────────────────
 def main():  # pylint: disable=too-many-branches,too-many-statements
-    """Point d'entrée principal."""
     ConsoleUI.enable_ansi()
     if os.name == "nt":
         os.system("title 🎬 CO-TUBE DOWNLOADER 🎬")
 
-    # ── Écran de démarrage ────────────────────────────────────────────────────
     ConsoleUI.clear()
     print(ConsoleUI.BANNER)
     print(f"\n  {ConsoleUI.DIM}⏳ Chargement, veuillez patienter...{ConsoleUI.RESET}\n")
 
-    steps    = [("yt-dlp + ffmpeg", setup_dependencies), ("FFmpeg", setup_ffmpeg)]
-    results  = {}
-    bar_w    = 40
+    steps   = [("yt-dlp + ffmpeg", setup_dependencies), ("FFmpeg", setup_ffmpeg)]
+    results = {}
+    bar_w   = 40
 
     for idx, (label, fn) in enumerate(steps):
         pct    = int((idx / len(steps)) * 100)
@@ -667,15 +868,19 @@ def main():  # pylint: disable=too-many-branches,too-many-statements
     if not ffmpeg_exe:
         ConsoleUI.warn("FFmpeg introuvable — la fusion vidéo/audio sera désactivée.")
 
-    # ── Dossier de téléchargement (config persistante) ────────────────────────
+    # ── Config persistante ────────────────────────────────────────────────────
     cfg      = _load_config()
     saved    = cfg.get("dest_dir", "")
-    fallback = _base_dir()          # dossier du script si rien dans la config
+    fallback = _base_dir()
     initial  = saved if saved and os.path.isdir(os.path.dirname(saved) or ".") else fallback
     dest_dir = [initial]
 
+    # Ré-intégrer les clés cookies dans cfg si déjà sauvegardées
+    # (elles sont déjà dans cfg via _load_config)
+
     # ── Boucle principale ─────────────────────────────────────────────────────
     while True:
+        cookie_info = _cookie_summary(cfg)
         choice = ConsoleUI.navigate(
             [
                 "🎬  Télécharger une vidéo",
@@ -683,13 +888,13 @@ def main():  # pylint: disable=too-many-branches,too-many-statements
                 "❌  Quitter",
             ],
             "MENU PRINCIPAL",
-            f"v{VERSION}  —  Dossier : {dest_dir[0]}",
+            f"v{VERSION}  —  {dest_dir[0]}  |  {cookie_info}",
         )
 
         if choice == 0:
-            menu_download(dest_dir, ffmpeg_exe)
+            menu_download(dest_dir, ffmpeg_exe, cfg)
         elif choice == 1:
-            menu_settings(dest_dir)
+            menu_settings(dest_dir, cfg, ffmpeg_exe)
         elif choice in (2, -1):
             ConsoleUI.result_screen([
                 f"  {ConsoleUI.CYAN}👋  Merci d'avoir utilisé CO-TUBE !{ConsoleUI.RESET}",
@@ -700,7 +905,6 @@ def main():  # pylint: disable=too-many-branches,too-many-statements
 
 
 def _goodbye():
-    """Affiche le message d'au revoir et quitte proprement."""
     try:
         ConsoleUI.clear()
         print(ConsoleUI.CYAN + "\n  " + "═"*58 + ConsoleUI.RESET)
