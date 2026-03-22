@@ -73,6 +73,15 @@ def _is_termux():
         or "com.termux" in os.environ.get("PREFIX", "")
     ))
 
+def _is_android():
+    """Détecte Android : Termux ET Pydroid3 (et autres runners Python Android)."""
+    if _is_termux():
+        return True
+    # Pydroid3 / QPython / autres : pas de var Termux mais le stockage Android est présent
+    if os.name != "nt" and os.path.isdir("/storage/emulated/0"):
+        return True
+    return False
+
 def _base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -1447,10 +1456,28 @@ def main():
     if not ffmpeg_exe:
         ConsoleUI.warn("FFmpeg introuvable — la fusion vidéo/audio sera désactivée.")
 
-    cfg      = _load_config()
-    saved    = cfg.get("dest_dir", "")
-    fallback = _base_dir()
-    initial  = saved if saved and os.path.isdir(os.path.dirname(saved) or ".") else fallback
+    cfg = _load_config()
+    saved = cfg.get("dest_dir", "")
+
+    if _is_android():
+        # Termux ET Pydroid3 : téléchargements dans le stockage interne Android
+        fallback = "/storage/emulated/0/Download/co-tube"
+    else:
+        fallback = _base_dir()
+
+    # Si un chemin personnalisé a été sauvegardé et qu'il est accessible, on l'utilise
+    if saved and os.path.isdir(os.path.dirname(saved) or "."):
+        initial = saved
+    else:
+        initial = fallback
+
+    try:
+        os.makedirs(initial, exist_ok=True)
+    except OSError:
+        # Fallback si le stockage interne n'est pas accessible (permissions manquantes)
+        initial = os.path.join(os.path.expanduser("~"), "co-tube")
+        os.makedirs(initial, exist_ok=True)
+
     dest_dir = [initial]
 
     while True:
