@@ -677,22 +677,18 @@ def _apply_cookies(ydl_opts: dict, cfg: dict, verbose: bool = False) -> str | No
 # Téléchargement
 # ─────────────────────────────────────────────────────────────────────────────
 def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
-    """Télécharge la vidéo avec toutes les pistes audio (doublages) et les
-    sous-titres manuels, le tout intégré dans un fichier MKV.
-
-    Stratégie :
-      1. extract_info() → détecter les langues audio et les sous-titres MANUELS
-      2. Format dynamique : bestvideo + une piste audio par langue doublée
-      3. ignoreerrors=True → jamais de crash sur une erreur de sous-titre (429)
-      4. ffmpeg merge → MKV avec toutes les pistes intégrées
-      5. Déplacement tmp → dest_dir, nettoyage
+    """Télécharge la vidéo en MP4 (meilleure qualité).
+    - Sous-titres manuels intégrés dans le MP4 (sélectionnables dans VLC)
+    - Téléchargement dans .cotube_tmp/, un seul MP4 déplacé vers dest_dir
+    - Nettoyage complet du dossier temp à la fin
     """
     import yt_dlp
 
     os.makedirs(dest_dir, exist_ok=True)
 
-    # ── Dossier temporaire dédié ──────────────────────────────────────────────
     tmp_dir = os.path.join(dest_dir, ".cotube_tmp")
+    # Repartir d'un temp propre à chaque fois
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
     class _Logger:
@@ -703,7 +699,7 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
             pass
         def error(self, msg):
             if "429" in msg:
-                print(f"  \033[33m⚠  Ignoré (429 — limite YouTube) : {msg[:80]}\033[0m")
+                print(f"  \033[33m⚠  Ignoré (429) : {msg[:80]}\033[0m")
             else:
                 print(f"  \033[31m✖  {msg}\033[0m")
 
@@ -719,7 +715,6 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
             "logger":       _Logger(),
             "quiet":        True,
             "no_warnings":  True,
-            "ignoreerrors": False,
         }
         if ffmpeg_exe:
             ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
@@ -740,21 +735,20 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
             ConsoleUI.result_screen([f"  {ConsoleUI.RED}✖  Erreur : {exc}{ConsoleUI.RESET}"])
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return
-        _move_tmp_to_dest(tmp_dir, dest_dir, mode, label, ConsoleUI)
+        _finalise(tmp_dir, dest_dir, mode, label, ConsoleUI)
         return
 
     # ─────────────────────────────────────────────────────────────────────────
-    # MODE VIDÉO
+    # MODE VIDÉO : MP4 + sous-titres intégrés
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── Étape 1 : Analyse de la vidéo ─────────────────────────────────────────
+    # Étape 1 — Analyse
     ConsoleUI.clear()
     print(ConsoleUI.BANNER)
     print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.BOLD}ANALYSE DE LA VIDÉO...{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
 
-    audio_langs   = []
     manual_sub_langs = []
     titre = "video"
 
@@ -770,304 +764,132 @@ def do_download(url, mode, dest_dir, ffmpeg_exe, cfg):
         titre = info.get("title", "video")
         duree = info.get("duration", 0)
         m, s  = divmod(int(duree), 60)
+        manual_sub_langs = sorted((info.get("subtitles") or {}).keys())
 
-        # Détecter les pistes AUDIO-SEULEMENT avec une langue (doublages YouTube)
-        # On enlève la restriction vcodec=none qui manquait des formats
-        seen_langs = set()
-        for f in (info.get("formats") or []):
-            lang = f.get("language")
-            if not lang:
-                continue
-            acodec = f.get("acodec", "none")
-            vcodec = f.get("vcodec", "none")
-            # Piste audio pure (pas de vidéo) avec un codec audio valide
-            if acodec not in ("none", None, "") and vcodec in ("none", None, ""):
-                seen_langs.add(lang)
-        audio_langs = sorted(seen_langs)
-
-        # Sous-titres MANUELS seulement (pas les auto-générés = 150 langues)
-        subs_raw         = info.get("subtitles") or {}
-        manual_sub_langs = sorted(subs_raw.keys())
-
-        ConsoleUI.info(f"Titre         : {titre}")
-        ConsoleUI.info(f"Durée         : {m}m {s:02d}s")
-
-        if audio_langs:
-            ConsoleUI.info(
-                f"Pistes audio  : {ConsoleUI.BOLD}{len(audio_langs)} langue(s) "
-                f"— {', '.join(audio_langs[:12])}"
-                f"{'…' if len(audio_langs) > 12 else ''}{ConsoleUI.RESET}"
-            )
-        else:
-            ConsoleUI.info("Pistes audio  : piste unique (pas de doublages détectés)")
-
+        ConsoleUI.info(f"Titre       : {titre}")
+        ConsoleUI.info(f"Durée       : {m}m {s:02d}s")
         if manual_sub_langs:
             preview = manual_sub_langs[:10]
             more    = len(manual_sub_langs) - len(preview)
             ConsoleUI.info(
-                f"Sous-titres   : {ConsoleUI.BOLD}{len(manual_sub_langs)} langue(s) "
+                f"Sous-titres : {ConsoleUI.BOLD}{len(manual_sub_langs)} langue(s) "
                 f"— {', '.join(preview)}"
-                f"{f'  (+{more})' if more else ''}{ConsoleUI.RESET}"
+                + (f"  (+{more})" if more else "")
+                + ConsoleUI.RESET
             )
         else:
-            ConsoleUI.info("Sous-titres   : aucun sous-titre manuel disponible")
-
+            ConsoleUI.info("Sous-titres : aucun sous-titre manuel")
         ConsoleUI.sep()
 
     except Exception as exc:
-        ConsoleUI.warn(f"Analyse partielle ({exc}) — format par défaut utilisé.")
+        ConsoleUI.warn(f"Analyse partielle ({exc}) — format par défaut.")
 
-    # ── Étape 2 : Construire le format dynamiquement ──────────────────────────
-    if len(audio_langs) > 1:
-        # Sélecteur multi-pistes : bestvideo + une piste audio par langue
-        audio_parts = "+".join(
-            f"bestaudio[language={lang}]" for lang in audio_langs
-        )
-        fmt   = (f"bestvideo[ext=mp4]+{audio_parts}"
-                 f"/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                 f"/bestvideo+bestaudio/best")
-        label = f"MKV — {len(audio_langs)} pistes audio + sous-titres intégrés"
-        use_multistreams = True
-    else:
-        # Piste unique ou langue inconnue → format le plus fiable
-        fmt   = ("bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                 "/bestvideo[ext=mp4]+bestaudio"
-                 "/bestvideo+bestaudio/best")
-        label = "MKV — meilleure qualité + sous-titres intégrés"
-        use_multistreams = False
+    label = "MP4 — meilleure qualité + sous-titres intégrés"
 
-    ConsoleUI.info(f"Sélecteur     : {ConsoleUI.DIM}{fmt[:80]}{'…' if len(fmt)>80 else ''}{ConsoleUI.RESET}")
-    ConsoleUI.sep()
-
-    # ── Étape 3 : Options yt-dlp ──────────────────────────────────────────────
+    # Étape 2 — Options yt-dlp
     ydl_opts = {
-        "format":               fmt,
+        # Meilleure vidéo mp4 + meilleur audio m4a → merge en mp4 sans reencoder
+        "format":               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "outtmpl":              os.path.join(tmp_dir, "%(title)s.%(ext)s"),
         "noplaylist":           True,
         "logger":               _Logger(),
         "quiet":                True,
         "no_warnings":          True,
-        "merge_output_format":  "mkv",
-        # ignoreerrors = True : NE JAMAIS planter sur une erreur de sous-titre (429)
-        # La vidéo sera toujours sauvegardée même si des subs échouent
-        "ignoreerrors":         True,
-        # Sous-titres MANUELS uniquement (pas les 150 auto-générés)
+        "merge_output_format":  "mp4",
+        "ignoreerrors":         True,       # ne jamais crasher sur erreur de sub
+        # Sous-titres manuels seulement (pas les 150 auto-générés)
         "writesubtitles":       True,
-        "writeautomaticsub":    False,      # ← clé du fix 429 : pas d'auto-subs
-        "subtitleslangs":       ["all"],    # toutes les langues manuelles
+        "writeautomaticsub":    False,
+        "subtitleslangs":       ["all"],
         "postprocessors": [
-            # Intègre les sous-titres dans le MKV après le merge vidéo
+            # Convertit et intègre les subs dans le MP4 (format mov_text)
             {"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False},
             {"key": "FFmpegMetadata",       "add_metadata": True},
         ],
+        # Supprime les fichiers .vtt/.srt séparés après intégration
+        "keepvideo":            False,
     }
-    if use_multistreams:
-        ydl_opts["audio_multistreams"] = True
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
-
     _apply_cookies(ydl_opts, cfg, verbose=True)
 
     print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.BOLD}TÉLÉCHARGEMENT EN COURS{ConsoleUI.RESET}")
+    print(f"  {ConsoleUI.DIM}Format  : {label}{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.DIM}Sortie  : {dest_dir}{ConsoleUI.RESET}")
-    print(f"  {ConsoleUI.DIM}Temp    : {tmp_dir}{ConsoleUI.RESET}")
-    print(f"  {ConsoleUI.CYAN}ℹ  VLC : Audio › Piste audio  |  Sous-titres › Piste sous-titres{ConsoleUI.RESET}")
     print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
 
-    # ── Étape 4 : Téléchargement ─────────────────────────────────────────────
-    # ignoreerrors=True → yt-dlp ne lève plus DownloadError sur les subs ratés,
-    # il les saute et continue. La vidéo est TOUJOURS produite.
+    # Étape 3 — Téléchargement (ignoreerrors → jamais de crash)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    _move_tmp_to_dest(tmp_dir, dest_dir, mode, label, ConsoleUI)
+    _finalise(tmp_dir, dest_dir, mode, label, ConsoleUI)
 
 
+def _finalise(tmp_dir, dest_dir, mode, label, UI):
+    """Déplace UNIQUEMENT le fichier final (mp4/mp3) vers dest_dir.
+    Supprime tous les fichiers temporaires et le dossier .cotube_tmp.
+    """
+    UI.info("Finalisation...")
 
+    final_ext = ".mp3" if mode == "audio" else ".mp4"
+    final_file = None
+    moved_name = None
 
-    os.makedirs(dest_dir, exist_ok=True)
-
-    # ── Dossier temporaire dédié ──────────────────────────────────────────────
-    tmp_dir = os.path.join(dest_dir, ".cotube_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    class _Logger:
-        def debug(self, msg):
-            if msg.startswith("[download]"):
-                print(msg)
-        def warning(self, msg):
-            pass
-        def error(self, msg):
-            # Les erreurs 429 sur les sous-titres ne sont pas fatales
-            if "429" in msg and "subtitle" in msg.lower():
-                print(f"  \033[33m⚠  Sous-titre ignoré (429 — limite YouTube)\033[0m")
-            else:
-                print(f"  \033[31m✖  {msg}\033[0m")
-
-    # ── MODE AUDIO : MP3 simple, pas de subs ─────────────────────────────────
-    if mode == "audio":
-        label = "Audio MP3"
-        ydl_opts = {
-            "format":      "bestaudio/best",
-            "outtmpl":     os.path.join(tmp_dir, "%(title)s.%(ext)s"),
-            "noplaylist":  True,
-            "logger":      _Logger(),
-            "quiet":       True,
-            "no_warnings": True,
-        }
-        if ffmpeg_exe:
-            ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
-            ydl_opts["postprocessors"]  = [{"key": "FFmpegExtractAudio",
-                                            "preferredcodec": "mp3",
-                                            "preferredquality": "192"}]
-
-        ConsoleUI.clear()
-        print(ConsoleUI.BANNER)
-        print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
-        print(f"  {ConsoleUI.BOLD}TÉLÉCHARGEMENT EN COURS — {label}{ConsoleUI.RESET}")
-        print(f"  {ConsoleUI.DIM}Destination : {dest_dir}{ConsoleUI.RESET}")
-        print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
-        _apply_cookies(ydl_opts, cfg, verbose=True)
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except yt_dlp.utils.DownloadError as exc:
-            ConsoleUI.result_screen([f"  {ConsoleUI.RED}✖  Erreur : {exc}{ConsoleUI.RESET}"])
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return
-
-        _move_tmp_to_dest(tmp_dir, dest_dir, mode, label, ConsoleUI)
-        return
-
-    # ── MODE VIDÉO : toutes pistes audio + subs intégrés dans MKV ────────────
-
-    # Étape 1 — Récupérer les infos pour détecter les pistes audio
-    ConsoleUI.clear()
-    print(ConsoleUI.BANNER)
-    print(f"\n  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}")
-    print(f"  {ConsoleUI.BOLD}ANALYSE DE LA VIDÉO...{ConsoleUI.RESET}")
-    print(f"  {ConsoleUI.CYAN}{'─'*58}{ConsoleUI.RESET}\n")
-
-    info        = None
-    audio_langs = []
-    all_sub_langs = []
-    titre = "video"
-
-    try:
-        info_opts = {
-            "quiet": True, "no_warnings": True,
-            "logger": _Logger(),
-        }
-        if ffmpeg_exe:
-            info_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
-        _apply_cookies(info_opts, cfg)
-
-        with yt_dlp.YoutubeDL(info_opts) as ydl_q:
-            info  = ydl_q.extract_info(url, download=False)
-
-        titre = info.get("title", "video")
-        duree = info.get("duration", 0)
-        m, s  = divmod(int(duree), 60)
-
-        # Détecter les langues audio distinctes
-        formats = info.get("formats") or []
-        audio_langs = sorted({
-            f.get("language")
-            for f in formats
-            if f.get("language")
-            and f.get("acodec", "none") != "none"
-            and f.get("vcodec", "none") == "none"  # piste audio pure seulement
-        } - {None})
-
-        # Détecter les sous-titres
-        subs_raw      = info.get("subtitles") or {}
-        auto_raw      = info.get("automatic_captions") or {}
-        all_sub_langs = sorted(set(list(subs_raw.keys()) + list(auto_raw.keys())))
-
-        ConsoleUI.info(f"Titre   : {titre}")
-        ConsoleUI.info(f"Durée   : {m}m {s:02d}s")
-        if audio_langs:
-            ConsoleUI.info(f"Pistes audio   : {ConsoleUI.BOLD}{', '.join(audio_langs)}{ConsoleUI.RESET}")
-        else:
-            ConsoleUI.info("Pistes audio   : piste unique (langue non spécifiée)")
-        if all_sub_langs:
-            preview = all_sub_langs[:8]
-            more    = len(all_sub_langs) - len(preview)
-            ConsoleUI.info(
-                f"Sous-titres    : {ConsoleUI.BOLD}"
-                + ", ".join(preview)
-                + (f"  (+{more} autres)" if more else "")
-                + ConsoleUI.RESET
-            )
-        ConsoleUI.sep()
-
-    except Exception as exc:
-        ConsoleUI.warn(f"Infos partielles ({exc}) — on continue avec format par défaut.")
-
-    # Étape 2 — Construire le sélecteur de format dynamiquement
-    if len(audio_langs) > 1:
-        # Plusieurs pistes audio détectées → les inclure toutes
-        audio_parts = "+".join(f"bestaudio[language={lang}]" for lang in audio_langs)
-        fmt = f"bestvideo[ext=mp4]+{audio_parts}/bestvideo+bestaudio/best"
-        label = f"Vidéo MKV ({len(audio_langs)} pistes audio + sous-titres)"
-    else:
-        # Une seule piste (ou langue inconnue) → format standard
-        fmt   = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-        label = "Vidéo MKV (meilleure qualité + sous-titres)"
-
-    ConsoleUI.info(f"Format sélectionné : {ConsoleUI.DIM}{fmt}{ConsoleUI.RESET}")
-    ConsoleUI.sep()
-
-
-def _move_tmp_to_dest(tmp_dir, dest_dir, mode, label, UI):
-    """Déplace tous les fichiers de tmp_dir vers dest_dir et affiche le bilan."""
-    UI.info("Déplacement vers le dossier final...")
-    moved, errors_move = [], []
     if os.path.isdir(tmp_dir):
-        for fname in sorted(os.listdir(tmp_dir)):
-            src = os.path.join(tmp_dir, fname)
-            dst = os.path.join(dest_dir, fname)
+        # Chercher le fichier final (mp4 ou mp3), ignorer les .temp.* et .vtt/.srt
+        candidates = [
+            f for f in os.listdir(tmp_dir)
+            if f.endswith(final_ext)
+            and ".temp." not in f
+            and ".part" not in f
+        ]
+        if candidates:
+            # Prendre le plus gros (= le fichier mergé, pas un fragment)
+            candidates.sort(key=lambda f: os.path.getsize(os.path.join(tmp_dir, f)), reverse=True)
+            src = os.path.join(tmp_dir, candidates[0])
+            dst = os.path.join(dest_dir, candidates[0])
+            # Éviter l'écrasement
             if os.path.exists(dst):
-                base, ext = os.path.splitext(fname)
+                base, ext = os.path.splitext(candidates[0])
                 i = 2
                 while os.path.exists(dst):
                     dst = os.path.join(dest_dir, f"{base} ({i}){ext}")
                     i += 1
             try:
                 shutil.move(src, dst)
-                moved.append(os.path.basename(dst))
-            except Exception as mv_err:
-                errors_move.append(f"{fname}: {mv_err}")
+                final_file = dst
+                moved_name = os.path.basename(dst)
+                UI.success(f"Fichier créé : {moved_name}")
+            except Exception as e:
+                UI.warn(f"Erreur déplacement : {e}")
+
+        # Nettoyage complet du dossier temp (vtt, srt, temp.mp4, fragments…)
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not final_file:
+        UI.result_screen([
+            f"  \033[31m✖  Aucun fichier {final_ext} trouvé dans le dossier temp.\033[0m",
+            f"  {UI.DIM}Le téléchargement a peut-être échoué silencieusement.{UI.RESET}",
+        ])
+        return
 
     lines = [
         f"  {UI.GREEN}✔  Téléchargement terminé !{UI.RESET}",
         f"  {UI.DIM}Format : {label}{UI.RESET}",
+        "",
         f"  {UI.CYAN}📂  {dest_dir}{UI.RESET}",
+        f"  {UI.DIM}   • {moved_name}{UI.RESET}",
     ]
-    if moved:
-        lines += ["", f"  {UI.DIM}Fichiers créés :{UI.RESET}"]
-        for name in moved:
-            lines.append(f"  {UI.DIM}   • {name}{UI.RESET}")
-    if errors_move:
-        for e in errors_move:
-            lines.append(f"  {UI.YELLOW}⚠  Erreur déplacement : {e}{UI.RESET}")
     if mode == "video":
         lines += [
             "",
-            f"  {UI.CYAN}ℹ  Ouvrez le fichier .mkv dans VLC :{UI.RESET}",
-            f"  {UI.DIM}   Langue audio  → Audio › Piste audio{UI.RESET}",
-            f"  {UI.DIM}   Sous-titres   → Sous-titres › Piste sous-titres{UI.RESET}",
+            f"  {UI.CYAN}ℹ  Sous-titres intégrés — sélectionnables dans VLC :{UI.RESET}",
+            f"  {UI.DIM}   Sous-titres › Piste sous-titres{UI.RESET}",
         ]
     UI.result_screen(lines)
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Menu téléchargement
-# ─────────────────────────────────────────────────────────────────────────────
 def menu_download(dest_dir, ffmpeg_exe, cfg):
     url = ConsoleUI.input_screen(
         "TÉLÉCHARGER UNE VIDÉO", "Collez le lien YouTube",
