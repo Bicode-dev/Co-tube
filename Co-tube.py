@@ -1460,8 +1460,9 @@ def main():
     saved = cfg.get("dest_dir", "")
 
     if _is_android():
-        # Termux ET Pydroid3 : téléchargements dans le stockage interne Android
-        fallback = "/storage/emulated/0/Download/co-tube"
+        # ── Android (Termux, Pydroid3, etc.) ─────────────────────────────────
+        # Dossier par défaut : Vidéos visibles dans la galerie et les fichiers
+        fallback = "/storage/emulated/0/Movies/CoTEAM/Co-tube"
     else:
         fallback = _base_dir()
 
