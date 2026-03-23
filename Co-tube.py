@@ -1476,7 +1476,7 @@ def main():
     if _is_android():
         # ── Android (Termux, Pydroid3, etc.) ─────────────────────────────────
         # Dossier par défaut : Vidéos visibles dans la galerie et les fichiers
-        fallback = "/storage/emulated/0/Download/Co/Co-tube"
+        fallback = "/storage/emulated/0/Download/Youtube"
         initial  = fallback
         try:
             os.makedirs(initial, exist_ok=True)
