@@ -88,20 +88,34 @@ def _base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 def _config_path():
-    return os.path.join(_base_dir(), "ytdl_config.json")
+    """Retourne le chemin du fichier de config, ou None sur Android (pas de config)."""
+    if _is_android():
+        return None
+    if os.name == "nt":
+        local_app = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        return os.path.join(local_app, "CoTEAM", "Co-Tube", "co-tube_config.json")
+    # Linux/macOS hors Android
+    return os.path.join(_base_dir(), "co-tube_config.json")
 
 def _load_config():
+    path = _config_path()
+    if path is None:
+        return {}
     try:
-        with open(_config_path(), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return _json.load(f)
     except Exception:
         return {}
 
 def _save_config(data):
+    path = _config_path()
+    if path is None:
+        return   # Android : pas de fichier de config
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         existing = _load_config()
         existing.update(data)
-        with open(_config_path(), "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             _json.dump(existing, f, indent=2)
     except Exception:
         pass
@@ -1462,22 +1476,67 @@ def main():
     if _is_android():
         # ── Android (Termux, Pydroid3, etc.) ─────────────────────────────────
         # Dossier par défaut : Vidéos visibles dans la galerie et les fichiers
-        fallback = "/storage/emulated/0/Download/Co-tube"
-    else:
-        fallback = _base_dir()
+        fallback = "/storage/emulated/0/Download/Co/Co-tube"
+        initial  = fallback
+        try:
+            os.makedirs(initial, exist_ok=True)
+        except OSError:
+            initial = os.path.join(os.path.expanduser("~"), "co-tube")
+            os.makedirs(initial, exist_ok=True)
 
-    # Si un chemin personnalisé a été sauvegardé et qu'il est accessible, on l'utilise
-    if saved and os.path.isdir(os.path.dirname(saved) or "."):
-        initial = saved
     else:
-        initial = fallback
+        # ── PC (Windows / Linux / macOS) ─────────────────────────────────────
+        config_file = _config_path()
+        config_exists = config_file and os.path.isfile(config_file)
 
-    try:
-        os.makedirs(initial, exist_ok=True)
-    except OSError:
-        # Fallback si le stockage interne n'est pas accessible (permissions manquantes)
-        initial = os.path.join(os.path.expanduser("~"), "co-tube")
-        os.makedirs(initial, exist_ok=True)
+        def _ask_dest_dir():
+            """Demande à l'utilisateur où télécharger les vidéos et crée le dossier."""
+            while True:
+                new = ConsoleUI.input_screen(
+                    "DOSSIER DE TÉLÉCHARGEMENT",
+                    "Chemin complet du dossier de téléchargement",
+                    subtitle="Ce choix sera sauvegardé dans la configuration.",
+                )
+                if not new:
+                    ConsoleUI.warn("Aucun chemin saisi. Veuillez en entrer un.")
+                    time.sleep(0.8)
+                    continue
+                try:
+                    os.makedirs(new, exist_ok=True)
+                    chosen = os.path.abspath(new)
+                    _save_config({"dest_dir": chosen})
+                    ConsoleUI.result_screen([
+                        f"  {ConsoleUI.GREEN}✔  Dossier configuré !{ConsoleUI.RESET}",
+                        f"  {ConsoleUI.CYAN}📂  {chosen}{ConsoleUI.RESET}",
+                    ])
+                    return chosen
+                except Exception as e:
+                    ConsoleUI.result_screen([f"  {ConsoleUI.RED}✖  {e}{ConsoleUI.RESET}"])
+
+        if not config_exists:
+            # Premier lancement : on demande le dossier
+            ConsoleUI.clear()
+            print(ConsoleUI.BANNER)
+            ConsoleUI.result_screen([
+                f"  {ConsoleUI.CYAN}{ConsoleUI.BOLD}Bienvenue dans CO-TUBE !{ConsoleUI.RESET}",
+                "",
+                f"  {ConsoleUI.DIM}Aucune configuration trouvée.{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}Veuillez choisir un dossier de téléchargement.{ConsoleUI.RESET}",
+            ])
+            initial = _ask_dest_dir()
+        elif not saved or not os.path.isdir(saved):
+            # Config présente mais le dossier n'existe plus / jamais configuré
+            ConsoleUI.clear()
+            print(ConsoleUI.BANNER)
+            ConsoleUI.result_screen([
+                f"  {ConsoleUI.YELLOW}⚠  Le dossier de téléchargement est introuvable :{ConsoleUI.RESET}",
+                f"  {ConsoleUI.DIM}{saved or '(non défini)'}{ConsoleUI.RESET}",
+                "",
+                f"  {ConsoleUI.DIM}Veuillez en choisir un nouveau.{ConsoleUI.RESET}",
+            ])
+            initial = _ask_dest_dir()
+        else:
+            initial = saved
 
     dest_dir = [initial]
 
