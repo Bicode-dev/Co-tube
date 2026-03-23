@@ -1462,7 +1462,7 @@ def main():
     if _is_android():
         # ── Android (Termux, Pydroid3, etc.) ─────────────────────────────────
         # Dossier par défaut : Vidéos visibles dans la galerie et les fichiers
-        fallback = "/storage/emulated/0/Movies/CoTEAM/Co-tube"
+        fallback = "/storage/emulated/0/Download/Co-tube"
     else:
         fallback = _base_dir()
 
